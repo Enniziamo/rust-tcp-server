@@ -1,319 +1,285 @@
-use bcrypt::{hash, verify, DEFAULT_COST};
-use serde::{Deserialize, Serialize};
+
+mod auth;
+mod chat;
+
+use chat::SecureConnection;
+use snow::{Builder, params::NoiseParams};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const USERS_FILE: &str = "users.json";
+const ADDRESS: &str = "0.0.0.0:1342";
+const KEY_FILE: &str = "server.key";
+const PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const RATE_LIMIT: Duration = Duration::from_millis(500);
 
-#[derive(Serialize, Deserialize)]
-struct User {
-    username: String,
-    password: String,
-}
+type Clients = Arc<Mutex<HashMap<String, Arc<Mutex<SecureConnection>>>>>;
 
-#[derive(Serialize, Deserialize, Default)]
-struct Users {
-    users: Vec<User>,
-}
+fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let mut size = [0u8; 4];
+    stream.read_exact(&mut size).map_err(|e| e.to_string())?;
 
-struct Client {
-    conn: TcpStream,
-    last_sent: Instant,
-}
-
-type Clients = Arc<Mutex<HashMap<String, Client>>>;
-
-fn load_users() -> Users {
-    match fs::read_to_string(USERS_FILE) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => Users::default(),
+    let len = u32::from_be_bytes(size) as usize;
+    if len == 0 || len > 65536 {
+        return Err("Invalid frame".into());
     }
+
+    let mut data = vec![0; len];
+    stream.read_exact(&mut data).map_err(|e| e.to_string())?;
+    Ok(data)
 }
 
-fn save_users(users: &Users) {
-    let json = serde_json::to_string_pretty(users)
-        .expect("JSON serialization failed");
-
-    fs::write(USERS_FILE, json).expect("Failed to write users.json");
+fn write_frame(stream: &mut TcpStream, data: &[u8]) -> Result<(), String> {
+    let size = (data.len() as u32).to_be_bytes();
+    stream.write_all(&size).map_err(|e| e.to_string())?;
+    stream.write_all(data).map_err(|e| e.to_string())
 }
 
-fn user_exists(users: &Users, username: &str) -> bool {
-    users.users.iter().any(|user| user.username == username)
+fn server_key() -> Vec<u8> {
+    if let Ok(key) = fs::read(KEY_FILE) {
+        return key;
+    }
+
+    let params: NoiseParams = PARAMS.parse().unwrap();
+    let keypair = Builder::new(params).generate_keypair().unwrap();
+
+    fs::write(KEY_FILE, &keypair.private).expect("Cannot save server key");
+
+    println!(
+        "SERVER PUBLIC KEY: {}",
+        keypair.public.iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    );
+
+    keypair.private
 }
 
-fn validate_username(username: &str) -> bool {
-    username.len() >= 3
-        && username.len() <= 20
-        && username.chars().all(|c| {
-            c.is_ascii_alphanumeric() || c == '_'
-        })
-}
+fn handshake(stream: &mut TcpStream, private: &[u8])
+    -> Result<SecureConnection, String>
+{
+    let params: NoiseParams = PARAMS.parse().map_err(|e| format!("{e}"))?;
 
-fn send(stream: &mut TcpStream, message: &str) {
-    let _ = stream.write_all(message.as_bytes());
+    let builder = Builder::new(params)
+        .local_private_key(private);
+
+    let mut noise = builder.build_responder()
+        .map_err(|e| e.to_string())?;
+
+    let mut buffer = vec![0u8; 65536];
+
+    // Message 1
+    let msg1 = read_frame(stream)?;
+    noise.read_message(&msg1, &mut buffer)
+        .map_err(|e| e.to_string())?;
+
+    // Message 2
+    let len = noise.write_message(&[], &mut buffer)
+        .map_err(|e| e.to_string())?;
+
+    write_frame(stream, &buffer[..len])?;
+
+    // Message 3
+    let msg3 = read_frame(stream)?;
+    noise.read_message(&msg3, &mut buffer)
+        .map_err(|e| e.to_string())?;
+
+    // XX handshake completed.
+    let transport = noise.into_transport_mode()
+        .map_err(|e| e.to_string())?;
+
+    Ok(SecureConnection::new(stream.try_clone().map_err(|e| e.to_string())?, transport))
 }
 
 fn broadcast(clients: &Clients, sender: &str, message: &str) {
-    let mut clients = clients.lock().unwrap();
-
-    for (username, client) in clients.iter_mut() {
-    	if username != sender {
-    		let _ = client.conn.write_all(
-    			format!("{}> {}\n", sender, message).as_bytes()
-            );
-        }
-}
-}
-
-fn private_message(clients: &Clients, sender: &str, target: &str,    message: &str,) {
     let clients = clients.lock().unwrap();
 
-    if let Some(client) = clients.get(target) {
-        if let Ok(mut conn) = client.conn.try_clone() {
-            let _ = conn.write_all(
-                format!("(private) {}> {}\n", sender, message).as_bytes()
-            );
+    for (name, client) in clients.iter() {
+        if name != sender {
+            let _ = client.lock().unwrap()
+                .send(&format!("{}> {}", sender, message));
         }
     }
 }
 
-fn remove_client(clients: &Clients, username: &str) {
-    let mut clients = clients.lock().unwrap();
-    clients.remove(username);
-}
-
-fn handle_client(mut conn: TcpStream, clients: Clients) {
-    let reader_conn = match conn.try_clone() {
+fn handle_client(
+    mut stream: TcpStream,
+    clients: Clients,
+    private: Arc<Vec<u8>>,
+) {
+    let mut secure = match handshake(&mut stream, &private) {
         Ok(c) => c,
+        Err(e) => {
+            eprintln!("Handshake failed: {e}");
+            return;
+        }
+    };
+
+    if secure.send("Connected securely. 1=Register, 2=Login").is_err() {
+        return;
+    }
+
+    let choice = match secure.receive() {
+        Ok(v) => v,
         Err(_) => return,
     };
 
-    let mut reader = BufReader::new(reader_conn);
+    let username = match secure.receive() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
 
-    send(&mut conn, "Connected to server\n");
-    send(&mut conn, "1) Register\n2) Login\n> ");
-
-    let mut choice = String::new();
-
-    if reader.read_line(&mut choice).is_err() {
+    if !auth::validate_username(&username) {
+        let _ = secure.send("Invalid username.");
         return;
     }
 
-    let choice = choice.trim().to_string();
+    let register = choice == "1";
 
-    send(&mut conn, "Username: ");
-
-    let mut username = String::new();
-
-    if reader.read_line(&mut username).is_err() {
+    if !register && choice != "2" {
+        let _ = secure.send("Invalid choice.");
         return;
     }
 
-    let username = username.trim().to_string();
+    let mut authenticated = false;
 
-    if !validate_username(&username) {
-        send(&mut conn, "Invalid username.\n");
-        return;
-    }
+    let attempts = if register { 1 } else { 3 };
 
-    send(&mut conn, "Password: ");
-
-    let mut password = String::new();
-
-    if reader.read_line(&mut password).is_err() {
-        return;
-    }
-
-    let password = password.trim().to_string();
-
-    let mut users = load_users();
-
-    match choice.as_str() {
-        "1" => {
-            if user_exists(&users, &username) {
-                send(&mut conn, "User already exists.\n");
-                return;
-            }
-
-            let hashed = match hash(&password, DEFAULT_COST) {
-                Ok(h) => h,
-                Err(_) => {
-                    send(&mut conn, "Server error.\n");
-                    return;
-                }
-            };
-
-            users.users.push(User {
-                username: username.clone(),
-                password: hashed,
-            });
-
-            if let Err(_) = fs::write(
-                USERS_FILE,
-                serde_json::to_string_pretty(&users).unwrap(),
-            ) {
-                send(&mut conn, "Failed to save user.\n");
-                return;
-            }
-
-            send(&mut conn, "Registered successfully.\n");
+    for attempt in 0..attempts {
+        if secure.send("Password:").is_err() {
+            return;
         }
-        "2" => {
-            let stored_password = users
-                .users
-                .iter()
-                .find(|user| user.username == username)
-                .map(|user| user.password.clone());
 
-            let stored_password = match stored_password {
-                Some(password) => password,
-                None => {
-                    send(&mut conn, "User not found.\n");
-                    return;
-                }
-            };
+        let password = match secure.receive() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
 
-            if !verify(&password, &stored_password).unwrap_or(false) {
-                send(&mut conn, "Wrong password.\n");
-                return;
-            }
-
-            send(&mut conn, "Login successful.\n");
+        if auth::authenticate(&username, &password, register).is_ok() {
+            authenticated = true;
+            break;
         }
-        _ => {
-            send(&mut conn, "Invalid choice.\n");
+
+        let remaining = attempts - attempt - 1;
+
+        if secure.send(&format!("Wrong password. Remaining: {}", remaining)).is_err() {
             return;
         }
     }
 
-    let client_conn = match conn.try_clone() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    if !authenticated {
+        let _ = secure.send("Authentication failed. Disconnecting.");
+        return;
+    }
+
+    let connection = Arc::new(Mutex::new(secure));
 
     {
         let mut online = clients.lock().unwrap();
 
         if online.contains_key(&username) {
-            send(&mut conn, "User already online.\n");
+            let _ = connection.lock().unwrap().send("Already online.");
             return;
         }
 
-        online.insert(
-            username.clone(),
-            Client {
-                conn: client_conn,
-                last_sent: Instant::now(),
-            },
-        );
+        online.insert(username.clone(), connection.clone());
     }
 
+    let _ = connection.lock().unwrap().send("Login successful.");
     broadcast(&clients, &username, "joined the chat");
 
-    send(&mut conn, &format!("Welcome {}\n", username));
+    let mut last_sent = Instant::now();
 
     loop {
-        let mut msg = String::new();
+        let message = match connection.lock().unwrap().receive() {
+            Ok(v) => v,
+            Err(_) => break,
+        };
 
-        match reader.read_line(&mut msg) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
+        let message = message.trim();
 
-        let msg = msg.trim().to_string();
-
-        if msg.is_empty() {
+        if message.is_empty() {
             continue;
         }
 
-        if msg == "/exit" {
-            send(&mut conn, "Goodbye.\n");
+        if message == "/exit" {
+            let _ = connection.lock().unwrap().send("Goodbye.");
             break;
         }
 
-        {
-            let mut online = clients.lock().unwrap();
+        if last_sent.elapsed() < RATE_LIMIT {
+            let _ = connection.lock().unwrap()
+                .send("You are sending messages too fast.");
+            continue;
+        }
 
-            if let Some(client) = online.get_mut(&username) {
-                if client.last_sent.elapsed() < RATE_LIMIT {
-                    send(&mut conn, "You are sending messages too fast.\n");
-                    continue;
+        last_sent = Instant::now();
+
+        if message == "/online" {
+            let names = clients.lock().unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let _ = connection.lock().unwrap()
+                .send(&format!("Online: {}", names));
+            continue;
+        }
+
+        if let Some(rest) = message.strip_prefix("/msg ") {
+            if let Some((target, text)) = rest.split_once(' ') {
+                let clients = clients.lock().unwrap();
+
+                if let Some(client) = clients.get(target) {
+                    let _ = client.lock().unwrap()
+                        .send(&format!("(private) {}: {}", username, text));
+                } else {
+                    let _ = connection.lock().unwrap()
+                        .send("User not online.");
                 }
-
-                client.last_sent = Instant::now();
-            } else {
-                break;
-            }
-        }
-
-        if msg == "/online" {
-            let online = clients.lock().unwrap();
-
-            send(&mut conn, "Online users:\n");
-
-            for user in online.keys() {
-                send(&mut conn, &format!("- {}\n", user));
             }
 
             continue;
         }
 
-        if let Some(rest) = msg.strip_prefix("/msg ") {
-            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+        let _ = connection.lock().unwrap()
+            .send(&format!("you> {}", message));
 
-            if parts.len() == 2 {
-                private_message(
-                    &clients,
-                    &username,
-                    parts[0],
-                    parts[1],
-                );
-            }
-
-            continue;
-        }
-
-        send(&mut conn, &format!("you> {}\n", msg));
-        broadcast(&clients, &username, &msg);
+        broadcast(&clients, &username, message);
     }
 
-    remove_client(&clients, &username);
+    clients.lock().unwrap().remove(&username);
     broadcast(&clients, &username, "left the chat");
 
-    println!("{} disconnected", username);
+    println!("{username} disconnected");
 }
 
 fn main() {
-    if !std::path::Path::new(USERS_FILE).exists() {
-        save_users(&Users::default());
-    }
+    let private = Arc::new(server_key());
 
-    let listener = TcpListener::bind("0.0.0.0:1342")
-        .expect("Could not start server");
+    let listener = TcpListener::bind(ADDRESS)
+        .expect("Server could not start");
 
     let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
 
-    println!("Server running on 0.0.0.0:1342");
+    println!("Secure chat running on {ADDRESS}");
 
     for stream in listener.incoming() {
         match stream {
-            Ok(conn) => {
+            Ok(stream) => {
                 let clients = Arc::clone(&clients);
+                let private = Arc::clone(&private);
 
                 thread::spawn(move || {
-                    handle_client(conn, clients);
+                    handle_client(stream, clients, private);
                 });
             }
-
-            Err(e) => {
-                eprintln!("Connection error: {}", e);
-            }
+            Err(e) => eprintln!("Connection error: {e}"),
         }
     }
 }

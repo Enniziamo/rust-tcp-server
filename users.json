@@ -1,0 +1,12 @@
+{
+  "users": [
+    {
+      "username": "Alex",
+      "password": "$2b$12$9sY1rNkLXENiI3eUsju2BONiXfCRQpV.og6nesLOC9pinA4rSFDi6"
+    },
+    {
+      "username": "Rex",
+      "password": "$2b$12$C3.i.KZ6.uMazyIfbX90F.Jy4juSeMdbXIeo3o5tI9GxjZlNhuIJm"
+    }
+  ]
+}
